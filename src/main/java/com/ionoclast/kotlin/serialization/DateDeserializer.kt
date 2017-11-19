@@ -32,6 +32,7 @@ import com.google.gson.JsonDeserializer
 import com.google.gson.JsonElement
 import java.lang.reflect.Type
 import java.text.ParseException
+import java.text.SimpleDateFormat
 import java.util.*
 
 
@@ -40,14 +41,19 @@ import java.util.*
  *
  * @see GsonBuilder.registerTypeAdapter
  */
-class DateDeserializer : JsonDeserializer<Date> {
+class DateDeserializer(private val fallbackDateFormat: String?) : JsonDeserializer<Date> {
+    private val fmt by lazy { SimpleDateFormat(fallbackDateFormat) }
+
     override fun deserialize(json: JsonElement, typeOfT: Type, context: JsonDeserializationContext): Date {
-        val unix = json.asString
+        val timestamp = json.asString
 
         try {
-            return Date(unix.toLong() * 1000L)
+            return Date(timestamp.toLong() * 1000L)
         } catch (e: Exception) {
-            throw ParseException("Unknown date format $unix", 0)
+            fallbackDateFormat?.let {
+                return fmt.parse(timestamp)
+            }
+            throw ParseException("Unknown date format $timestamp", 0)
         }
     }
 }

@@ -33,7 +33,6 @@ import com.google.gson.GsonBuilder
 import com.ionoclast.kotlin.coroutine.AndroidUI
 import com.ionoclast.kotlin.coroutine.task
 import com.ionoclast.kotlin.serialization.DateDeserializer
-import com.sdge.emergencymanagement.BuildConfig
 import kotlinx.coroutines.experimental.*
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
@@ -41,7 +40,7 @@ import retrofit2.Call
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import java.io.IOException
-import java.lang.Exception
+import java.net.SocketException
 import java.util.*
 import java.util.concurrent.TimeUnit
 
@@ -79,15 +78,17 @@ abstract class AbstractRestClient {
     }
 
 
-    data class Response<out T>(val result: T? = null, val err: Throwable? = null)
+    data class RestResponse<out T>(val result: T? = null, val err: Throwable? = null)
 
     class ApiError(msg: String, cause: Throwable? = null) : IOException(msg, cause)
 
 
-    abstract val BASE_URI: String
     abstract val TIMEOUT_SECS: Long?
 
-    protected val restClient by lazy { buildClientAdapter() }
+    protected var restClient = buildClientAdapter()
+
+    abstract val baseUri: String
+    open protected val fallbackDateFormat: String? get() = null
 
     /**
      * *Executes the given `Call` in a coroutine on a worker thread, cancellable via the given `Job`.*
@@ -101,15 +102,26 @@ abstract class AbstractRestClient {
      * @see Job
      */
     protected suspend fun <T> makeRequest(job: Job, call: Call<T>) = try {
-        val response = task(CommonPool + job) { call.execute()  }
-        response.takeIf { it.isSuccessful } ?.let { Response(it.body()) }
-                ?: Response(err = ApiError("API Error (${response.code()}): ${response.errorBody()}"))
-    } catch (cancelled: CancellationException) {
-        Log.d(TAG, "API call cancelled: ${call.request().url()}")
-        call.cancel()
-        Response<T>(err = cancelled)
-    } catch (ex: Exception) {
-        Response<T>(err = ApiError("API call failed: ${call.request().url()}", ex))
+        task(CommonPool + job) {
+            try {
+                call.execute().let { response ->
+                    response.takeIf { it.isSuccessful }?.let { RestResponse(it.body()) }
+                    ?: RestResponse(err = ApiError("API Error (${response.code()}): ${response.errorBody()}"))
+                }
+            } catch (ex: Throwable) {
+                if (ex is SocketException && (ex.message == "Socket closed") ||
+                    ex is IOException && (ex.message == "Canceled")) {
+                    Log.v(TAG, "API call cancelled: ${call.request().url()}")
+                    try { call.cancel() } catch (_: Throwable) { /* ignore */ }
+                    RestResponse(err = CancellationException(ex.message))
+                } else {
+                    RestResponse<T>(err = ApiError("API call failed: ${call.request().url()}", ex))
+                }
+            }
+        }
+    } catch (ex: CancellationException) {
+        Log.v(TAG, "API call cancelled: ${call.request().url()}")
+        RestResponse<T>(err = ex)
     }
 
     /**
@@ -126,10 +138,10 @@ abstract class AbstractRestClient {
      * control over how the components are configured.
      *
      * @see TIMEOUT_SECS
-     * @see BASE_URI
+     * @see baseUri
      * @see DateDeserializer
      */
-    protected fun buildClientAdapter(): Retrofit {
+    open protected fun buildClientAdapter(): Retrofit {
         val logger = HttpLoggingInterceptor()
         logger.level = if (BuildConfig.DEBUG) HttpLoggingInterceptor.Level.BODY else HttpLoggingInterceptor.Level.NONE
         val client = OkHttpClient.Builder()
@@ -137,12 +149,11 @@ abstract class AbstractRestClient {
                 .connectTimeout(TIMEOUT_SECS ?: 0L, TimeUnit.SECONDS)
                 .readTimeout(TIMEOUT_SECS ?: 0L, TimeUnit.SECONDS)
                 .build()
-        val gson = GsonBuilder().registerTypeAdapter(Date::class.java, DateDeserializer()).create()
-        val retrofit = Retrofit.Builder()
-                .baseUrl(BASE_URI)
+        val gson = GsonBuilder().registerTypeAdapter(Date::class.java, DateDeserializer(fallbackDateFormat)).create()
+        return Retrofit.Builder()
+                .baseUrl(baseUri)
                 .client(client)
                 .addConverterFactory(GsonConverterFactory.create(gson))
                 .build()
-        return retrofit
     }
 }
